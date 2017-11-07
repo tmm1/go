@@ -7,6 +7,7 @@ package poll
 import (
 	"errors"
 	"internal/race"
+	"internal/syscall/windows"
 	"io"
 	"runtime"
 	"sync"
@@ -92,6 +93,7 @@ type operation struct {
 	fd     *FD
 	errc   chan error
 	buf    syscall.WSABuf
+	msg    windows.WSAMsg
 	sa     syscall.Sockaddr
 	rsa    *syscall.RawSockaddrAny
 	rsan   int32
@@ -925,4 +927,100 @@ func (fd *FD) RawWrite(f func(uintptr) bool) error {
 			return err
 		}
 	}
+}
+
+func sockaddrToRaw(sa syscall.Sockaddr) (unsafe.Pointer, int32, error) {
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet4:
+		var raw syscall.RawSockaddrInet4
+		raw.Family = syscall.AF_INET
+		p := (*[2]byte)(unsafe.Pointer(&raw.Port))
+		p[0] = byte(sa.Port >> 8)
+		p[1] = byte(sa.Port)
+		for i := 0; i < len(sa.Addr); i++ {
+			raw.Addr[i] = sa.Addr[i]
+		}
+		return unsafe.Pointer(&raw), int32(unsafe.Sizeof(raw)), nil
+	case *syscall.SockaddrInet6:
+		var raw syscall.RawSockaddrInet6
+		raw.Family = syscall.AF_INET6
+		p := (*[2]byte)(unsafe.Pointer(&raw.Port))
+		p[0] = byte(sa.Port >> 8)
+		p[1] = byte(sa.Port)
+		raw.Scope_id = sa.ZoneId
+		for i := 0; i < len(sa.Addr); i++ {
+			raw.Addr[i] = sa.Addr[i]
+		}
+		return unsafe.Pointer(&raw), int32(unsafe.Sizeof(raw)), nil
+	default:
+		return nil, 0, syscall.EWINDOWS
+	}
+}
+
+// ReadMsg wraps the WSARecvMsg network call.
+func (fd *FD) ReadMsg(p []byte, oob []byte) (int, int, int, syscall.Sockaddr, error) {
+	if err := fd.readLock(); err != nil {
+		return 0, 0, 0, nil, err
+	}
+	defer fd.readUnlock()
+
+	o := &fd.rop
+	o.InitBuf(p)
+	oobn := len(oob)
+	if oobn > 0 {
+		o.msg.Control.Buf = &oob[0]
+	}
+	o.msg.Control.Len = uint32(oobn)
+	o.rsa = new(syscall.RawSockaddrAny)
+	o.msg.Name = o.rsa
+	o.msg.Namelen = int32(unsafe.Sizeof(*o.rsa))
+	o.msg.Buffers = &o.buf
+	o.msg.BufferCount = 1
+	n, err := rsrv.ExecIO(o, func(o *operation) error {
+		return windows.WSARecvMsg(o.fd.Sysfd, &o.msg, &o.qty, &o.o, nil)
+	})
+	if err == windows.WSAEMSGSIZE && (o.msg.Flags&windows.MSG_CTRUNC) != 0 {
+		// On windows, EMSGSIZE is raised in addition to MSG_CTRUNC, and
+		// the original untruncated length of the control data is returned.
+		// We reset the length back to the truncated portion which was received,
+		// so the caller doesn't try to go out of bounds.
+		// We also ignore the EMSGSIZE to emulate behavior of other platforms.
+		o.msg.Control.Len = uint32(oobn)
+		err = nil
+	}
+	err = fd.eofError(n, err)
+	var sa syscall.Sockaddr
+	sa, err = o.msg.Name.Sockaddr()
+	return n, int(o.msg.Control.Len), int(o.msg.Flags), sa, err
+}
+
+// WriteMsg wraps the WSASendMsg network call.
+func (fd *FD) WriteMsg(p []byte, oob []byte, sa syscall.Sockaddr) (int, int, error) {
+	if err := fd.writeLock(); err != nil {
+		return 0, 0, err
+	}
+	defer fd.writeUnlock()
+
+	o := &fd.wop
+	o.InitBuf(p)
+	if len(oob) > 0 {
+		o.msg.Control.Buf = &oob[0]
+	}
+	o.msg.Control.Len = uint32(len(oob))
+	if sa != nil {
+		rsa, len, err := sockaddrToRaw(sa)
+		if err != nil {
+			return 0, 0, err
+		}
+		o.msg.Name = (*syscall.RawSockaddrAny)(rsa)
+		o.msg.Namelen = len
+	} else {
+		o.msg.Namelen = 0
+	}
+	o.msg.Buffers = &o.buf
+	o.msg.BufferCount = 1
+	n, err := wsrv.ExecIO(o, func(o *operation) error {
+		return windows.WSASendMsg(o.fd.Sysfd, &o.msg, 0, &o.qty, &o.o, nil)
+	})
+	return n, int(o.msg.Control.Len), err
 }
